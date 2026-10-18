@@ -31,3 +31,6 @@ jobs:
 
       - name: Build ESP-01 Relay Firmware
         run: pio run -e esp01_relay
+
+      - name: Build ESP32-C3 Super Mini Firmware
+        run: pio run -e esp32c3mini

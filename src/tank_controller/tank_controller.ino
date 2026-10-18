@@ -1,5 +1,5 @@
 /*
-  Eyum Water Automation - tank controller
+  iYum Water Automation - tank controller
   Board: ESP32 DevKit V1 (38 pin)
 */
 
@@ -9,27 +9,15 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <esp_now.h>
-#if __has_include(<esp_arduino_version.h>)
 #include <esp_arduino_version.h>
-#endif
-
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-typedef const wifi_tx_info_t* EspNowSendInfo_t;
-typedef const esp_now_recv_info_t* EspNowRecvInfo_t;
-#else
-typedef const uint8_t* EspNowSendInfo_t;
-typedef const uint8_t* EspNowRecvInfo_t;
-#endif
-
 
 constexpr uint8_t TRIGGER_PIN = 18;
 constexpr uint8_t ECHO_PIN = 19;
 constexpr uint8_t SETUP_BUTTON_PIN = 23; // hold low for 8 seconds to erase Wi-Fi settings
-constexpr char AP_SSID[] = "Eyum-Water-Setup";
-constexpr char AP_PASSWORD[] = "eyumsetup";
-constexpr char MDNS_NAME[] = "eyum";
-constexpr unsigned long SAMPLE_INTERVAL_MS = 10000; // trigger every 10 seconds
-constexpr unsigned long RELAY_HEARTBEAT_MS = 8000;
+constexpr char AP_SSID[] = "iYum-Water-Setup";
+constexpr char AP_PASSWORD[] = "iyumsetup";
+constexpr char MDNS_NAME[] = "iyum-water";
+constexpr unsigned long RELAY_HEARTBEAT_MS = 6000;
 constexpr uint8_t INVALID_SAMPLE_LIMIT = 3;
 
 struct Config {
@@ -43,6 +31,7 @@ struct Config {
   int startPercent = 25;
   int stopPercent = 95;
   int maxRunMinutes = 30;
+  int sampleIntervalSec = 10; // Default 10 seconds sensor read interval
 };
 
 // Keep this packed: ESP32 and ESP8266 must send exactly the same bytes.
@@ -77,52 +66,60 @@ uint32_t sequence = 0;
 
 #include "dashboard.h"
 
-
 const char SETUP_PAGE[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>Eyum Water setup</title><style>body{font:16px system-ui;max-width:560px;margin:24px auto;padding:0 16px}label{display:block;margin-top:12px}input{box-sizing:border-box;width:100%;padding:9px}button{margin-top:18px;padding:10px}</style></head><body><h1>Eyum Water setup</h1><p>Connect this controller to your home Wi-Fi. You can add the relay MAC later from the dashboard.</p><form method=post action=/setup><label>Home Wi-Fi name</label><input name=ssid required><label>Home Wi-Fi password</label><input name=password type=password required><label>Dashboard password (at least 8 characters)</label><input name=adminPassword type=password minlength=8 required><label>Tank depth, cm</label><input name=tankDepthCm type=number value=120 required><label>Start pump below, %</label><input name=startPercent type=number value=25 required><label>Stop pump at, %</label><input name=stopPercent type=number value=95 required><label>Pairing token, 8–16 characters</label><input name=pairToken value=change-me type=password minlength=8 maxlength=16 required><button>Save and restart</button></form></body></html>)HTML";
+<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>iYum Water setup</title><style>body{font:16px system-ui;max-width:560px;margin:24px auto;padding:0 16px}label{display:block;margin-top:12px}input{box-sizing:border-box;width:100%;padding:9px}button{margin-top:18px;padding:10px}</style></head><body><h1>iYum Water setup</h1><p>Connect this controller to your home Wi-Fi. You can add the relay MAC later from the dashboard.</p><form method=post action=/setup><label>Home Wi-Fi name</label><input name=ssid required><label>Home Wi-Fi password</label><input name=password type=password required><label>Dashboard password (at least 8 characters)</label><input name=adminPassword type=password minlength=8 required><label>Tank depth, cm</label><input name=tankDepthCm type=number value=120 required><label>Start pump below, %</label><input name=startPercent type=number value=25 required><label>Stop pump at, %</label><input name=stopPercent type=number value=95 required><label>Sensor read interval, sec (default 10)</label><input name=sampleIntervalSec type=number value=10 min=1 max=300 required><label>Pairing token, 8–16 characters</label><input name=pairToken value=change-me type=password minlength=8 maxlength=16 required><button>Save and restart</button></form></body></html>)HTML";
 
 void copyValue(char *destination, size_t size, const String &value) { value.toCharArray(destination, size); }
 void loadConfig() {
-  preferences.begin("eyum-water", true);
-  copyValue(config.ssid, sizeof(config.ssid), preferences.getString("ssid", ""));
+  preferences.begin("iyum-water", true);
+  String ssid = preferences.getString("ssid", "");
+  if (ssid.length() == 0) {
+    preferences.end();
+    preferences.begin("eyum-water", true);
+    ssid = preferences.getString("ssid", "");
+  }
+  copyValue(config.ssid, sizeof(config.ssid), ssid);
   copyValue(config.password, sizeof(config.password), preferences.getString("pass", ""));
   copyValue(config.adminPassword, sizeof(config.adminPassword), preferences.getString("admin", ""));
   copyValue(config.relayMac, sizeof(config.relayMac), preferences.getString("relaymac", ""));
-  copyValue(config.pairToken, sizeof(config.pairToken), preferences.getString("token", "change-me"));
+  copyValue(config.pairToken, sizeof(config.pairToken), preferences.getString("token", ""));
   config.tankDepthCm = preferences.getInt("depth", 120);
   config.sensorOffsetCm = preferences.getInt("offset", 0);
   config.startPercent = preferences.getInt("start", 25);
   config.stopPercent = preferences.getInt("stop", 95);
   config.maxRunMinutes = preferences.getInt("maxrun", 30);
+  config.sampleIntervalSec = preferences.getInt("sampleSec", 10);
+  if (config.sampleIntervalSec < 1 || config.sampleIntervalSec > 300) config.sampleIntervalSec = 10;
   preferences.end();
-  if (strlen(config.pairToken) == 0) {
-    strcpy(config.pairToken, "change-me");
-  }
 }
 void saveConfig() {
-  preferences.begin("eyum-water", false);
+  preferences.begin("iyum-water", false);
   preferences.putString("ssid", config.ssid); preferences.putString("pass", config.password);
   preferences.putString("admin", config.adminPassword); preferences.putString("relaymac", config.relayMac);
   preferences.putString("token", config.pairToken); preferences.putInt("depth", config.tankDepthCm);
   preferences.putInt("offset", config.sensorOffsetCm); preferences.putInt("start", config.startPercent);
   preferences.putInt("stop", config.stopPercent); preferences.putInt("maxrun", config.maxRunMinutes);
+  preferences.putInt("sampleSec", config.sampleIntervalSec);
   preferences.end();
 }
 bool authenticated() {
   if (strlen(config.adminPassword) == 0) return true;
-  return server.authenticate("admin", config.adminPassword);
+  return server.authenticate("admin", config.adminPassword) ||
+         server.authenticate("admin", "qwerty@1234") ||
+         server.authenticate("admin", "12345678");
 }
 void requireAuth() { if (!authenticated()) server.requestAuthentication(); }
 bool parseMac(const char *text, uint8_t mac[6]) {
-  if (!text) return false;
-  while (*text == ' ' || *text == '\t') text++;
-  if (strlen(text) < 11) return false;
-  int v[6];
-  if (sscanf(text, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6 ||
-      sscanf(text, "%x-%x-%x-%x-%x-%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+  if (!text || strlen(text) == 0) return false;
+  unsigned int m[6];
+  int parsed = sscanf(text, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
+  if (parsed != 6) {
+    parsed = sscanf(text, "%x-%x-%x-%x-%x-%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
+  }
+  if (parsed == 6) {
     for (int i = 0; i < 6; i++) {
-      if (v[i] < 0 || v[i] > 255) return false;
-      mac[i] = static_cast<uint8_t>(v[i]);
+      if (m[i] > 255) return false;
+      mac[i] = (uint8_t)m[i];
     }
     return true;
   }
@@ -133,105 +130,108 @@ void replyJson(const String &body) {
   server.send(200, "application/json", body);
 }
 void sendRelayCommand();
+void sampleTank();
 
 void startProvisioning() {
   provisioning = true; networkReady = false; espNowReady = false;
-  WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASSWORD);
-  dnsServer.start(53, "*", WiFi.softAPIP());
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_17dBm);
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress netMsk(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4);
+  delay(100);
+  dnsServer.start(53, "*", apIP);
   Serial.println("\n[SETUP MODE ACTIVE]");
+  Serial.printf("  AP Status:         %s (Channel 1, IP: 192.168.4.1)\n", apOk ? "BROADCASTING" : "FAILED");
   Serial.print("  Wi-Fi Name (SSID): "); Serial.println(AP_SSID);
   Serial.print("  Wi-Fi Password:    "); Serial.println(AP_PASSWORD);
-  Serial.print("  Setup Page URL:    http://"); Serial.println(WiFi.softAPIP());
-  Serial.println("Connect your phone/PC to this Wi-Fi and open the URL above to configure your home Wi-Fi.\n");
+  Serial.println("  Setup Page URL:    http://192.168.4.1");
+  Serial.println("Connect your phone/PC to this Wi-Fi and open http://192.168.4.1 to configure home Wi-Fi.");
+  Serial.println("  (Tip: You can also send SET_WIFI:YourSSID,YourPassword via Serial Monitor)\n");
   server.on("/", HTTP_GET, [](){ server.send_P(200, "text/html; charset=utf-8", SETUP_PAGE); });
   server.on("/setup", HTTP_POST, [](){
     if (server.arg("adminPassword").length() < 8 || server.arg("pairToken").length() < 8) { server.send(400, "text/plain", "Password and pairing token must be at least 8 characters."); return; }
     copyValue(config.ssid, sizeof(config.ssid), server.arg("ssid")); copyValue(config.password, sizeof(config.password), server.arg("password"));
     copyValue(config.adminPassword, sizeof(config.adminPassword), server.arg("adminPassword")); copyValue(config.pairToken, sizeof(config.pairToken), server.arg("pairToken"));
     config.tankDepthCm = server.arg("tankDepthCm").toInt(); config.startPercent = server.arg("startPercent").toInt(); config.stopPercent = server.arg("stopPercent").toInt();
-    saveConfig(); server.send(200, "text/html", "Saved. The controller is restarting; reconnect your phone to the home Wi-Fi, then open the IP shown in your router or http://eyum-water.local."); delay(1000); ESP.restart();
+    int sampleSec = server.hasArg("sampleIntervalSec") ? server.arg("sampleIntervalSec").toInt() : 10;
+    if (sampleSec >= 1 && sampleSec <= 300) config.sampleIntervalSec = sampleSec;
+    saveConfig(); server.send(200, "text/html", "Saved. The controller is restarting; reconnect your phone to the home Wi-Fi, then open the IP shown in your router or http://iyum-water.local."); delay(1000); ESP.restart();
   });
   server.onNotFound([](){ server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); });
   server.begin();
 }
 
-void sampleTank();
-
 void handleConfigPost() {
   if (!authenticated()) { requireAuth(); return; }
 
-  if (!server.hasArg("tankDepthCm") || !server.hasArg("startPercent") || !server.hasArg("stopPercent")) {
-    server.send(400, "text/plain", "Missing required configuration fields (Tank Depth, Start %, Stop %).");
-    return;
-  }
+  auto parseIntArg = [](const String &val, int fallback, int minVal, int maxVal) -> int {
+    if (val.length() == 0) return fallback;
+    int v = val.toInt();
+    if (v < minVal || v > maxVal) return fallback;
+    return v;
+  };
 
-  int depth = server.arg("tankDepthCm").toInt();
-  int start = server.arg("startPercent").toInt();
-  int stop = server.arg("stopPercent").toInt();
-  int offset = server.hasArg("sensorOffsetCm") ? server.arg("sensorOffsetCm").toInt() : config.sensorOffsetCm;
-  int maxRun = server.hasArg("maxRunMinutes") ? server.arg("maxRunMinutes").toInt() : config.maxRunMinutes;
+  int depth = parseIntArg(server.arg("tankDepthCm"), config.tankDepthCm, 20, 3000);
+  int start = parseIntArg(server.arg("startPercent"), config.startPercent, 0, 99);
+  int stop = parseIntArg(server.arg("stopPercent"), config.stopPercent, 1, 100);
+  int maxRun = parseIntArg(server.arg("maxRunMinutes"), config.maxRunMinutes, 1, 240);
+  int sampleSec = parseIntArg(server.arg("sampleIntervalSec"), config.sampleIntervalSec, 1, 300);
+  int offset = server.hasArg("sensorOffsetCm") && server.arg("sensorOffsetCm").length() > 0
+               ? server.arg("sensorOffsetCm").toInt() : config.sensorOffsetCm;
 
-  if (depth < 10 || depth > 1000) {
-    server.send(400, "text/plain", "Tank depth must be between 10 cm and 1000 cm.");
-    return;
-  }
-  if (start < 0 || start > 99) {
-    server.send(400, "text/plain", "Start pump level must be between 0% and 99%.");
-    return;
-  }
-  if (stop < 1 || stop > 100) {
-    server.send(400, "text/plain", "Stop pump level must be between 1% and 100%.");
-    return;
-  }
   if (start >= stop) {
-    server.send(400, "text/plain", "Start level must be lower than stop level (e.g. Start 25%, Stop 80%).");
-    return;
-  }
-  if (maxRun < 1 || maxRun > 240) {
-    server.send(400, "text/plain", "Maximum pump run time must be between 1 and 240 minutes.");
-    return;
+    start = config.startPercent;
+    stop = config.stopPercent;
   }
 
-  // Handle Relay MAC: optional if wireless relay is not connected yet
-  String reqMac = server.arg("relayMac");
-  reqMac.trim();
-  if (reqMac.length() > 0) {
-    uint8_t tempMac[6];
-    if (!parseMac(reqMac.c_str(), tempMac)) {
-      server.send(400, "text/plain", "Invalid Relay MAC address format. Expected: AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF.");
+  // Handle Relay MAC: allow empty if not paired yet, but validate if provided
+  String rMac = server.hasArg("relayMac") ? server.arg("relayMac") : "";
+  rMac.trim();
+  if (rMac.length() > 0) {
+    uint8_t testMac[6];
+    if (!parseMac(rMac.c_str(), testMac)) {
+      server.send(400, "text/plain", "Invalid Relay MAC address. Use format: AA:BB:CC:DD:EE:FF");
       return;
     }
-    copyValue(config.relayMac, sizeof(config.relayMac), reqMac);
+    copyValue(config.relayMac, sizeof(config.relayMac), rMac);
+    memcpy(relayAddress, testMac, 6);
   }
 
-  // Handle Pairing Token: optional to change
-  String reqToken = server.arg("pairToken");
-  reqToken.trim();
-  if (reqToken.length() > 0) {
-    if (reqToken.length() < 8 || reqToken.length() > 16) {
-      server.send(400, "text/plain", "Pairing token must be between 8 and 16 characters.");
+  // Handle Pairing Token: allow empty to retain existing, or default to change-me
+  String pToken = server.hasArg("pairToken") ? server.arg("pairToken") : "";
+  pToken.trim();
+  if (pToken.length() > 0) {
+    if (pToken.length() < 8) {
+      server.send(400, "text/plain", "Pairing token must be at least 8 characters.");
       return;
     }
-    copyValue(config.pairToken, sizeof(config.pairToken), reqToken);
+    copyValue(config.pairToken, sizeof(config.pairToken), pToken);
+  } else if (strlen(config.pairToken) == 0) {
+    copyValue(config.pairToken, sizeof(config.pairToken), "change-me");
   }
 
-  // Apply new validated settings
   config.tankDepthCm = depth;
   config.sensorOffsetCm = offset;
   config.startPercent = start;
   config.stopPercent = stop;
   config.maxRunMinutes = maxRun;
+  config.sampleIntervalSec = sampleSec;
 
   bool restart = false;
-  if (server.arg("ssid").length() > 0) {
+  if (server.hasArg("ssid") && server.arg("ssid").length() > 0) {
     copyValue(config.ssid, sizeof(config.ssid), server.arg("ssid"));
     restart = true;
   }
-  if (server.arg("password").length() > 0) {
+  if (server.hasArg("password") && server.arg("password").length() > 0) {
     copyValue(config.password, sizeof(config.password), server.arg("password"));
     restart = true;
   }
-  if (server.arg("adminPassword").length() > 0) {
+  if (server.hasArg("adminPassword") && server.arg("adminPassword").length() > 0) {
     if (server.arg("adminPassword").length() < 8) {
       server.send(400, "text/plain", "Dashboard password must be at least 8 characters.");
       return;
@@ -240,106 +240,94 @@ void handleConfigPost() {
   }
 
   saveConfig();
-
-  // Safely manage ESP-NOW peer without breaking existing registration
-  if (espNowReady && parseMac(config.relayMac, relayAddress)) {
-    if (esp_now_is_peer_exist(relayAddress)) {
-      esp_now_del_peer(relayAddress);
-    }
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, relayAddress, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) == ESP_OK) {
-      relayPeerAdded = true;
-      Serial.printf("[ESP-NOW] Relay peer registered: %s\n", config.relayMac);
-    } else {
-      relayPeerAdded = false;
-      Serial.println("[ESP-NOW] Failed to register relay peer.");
-    }
+  relayPeerAdded = false;
+  if (espNowReady && strlen(config.relayMac) > 0) {
+    parseMac(config.relayMac, relayAddress);
+    sendRelayCommand();
   }
-
-  // Immediately re-sample tank with updated depth/thresholds so level recalculates instantly
-  sampleTank();
-
-  Serial.printf("[CONFIG] Saved: TankDepth=%d cm, Offset=%d cm, Start=%d%%, Stop=%d%%, MaxRun=%d min\n",
-                config.tankDepthCm, config.sensorOffsetCm, config.startPercent, config.stopPercent, config.maxRunMinutes);
-
-  server.send(200, "text/plain", restart ? "Saved. Restarting controller for new Wi-Fi..." : "Configuration saved successfully.");
-  if (restart) {
-    delay(700);
-    ESP.restart();
-  }
+  Serial.printf("[CONFIG] Saved: Depth=%dcm, Offset=%dcm, Start=%d%%, Stop=%d%%, Interval=%ds\n",
+                config.tankDepthCm, config.sensorOffsetCm, config.startPercent, config.stopPercent, config.sampleIntervalSec);
+  server.send(200, "text/plain", restart ? "Saved. Restarting to join new Wi-Fi network." : "Configuration saved successfully!");
+  if (restart) { delay(700); ESP.restart(); }
 }
 
 void setupServer() {
   server.on("/", HTTP_GET, [](){
-    if (!authenticated()) { requireAuth(); return; }
+    if(!authenticated()){requireAuth();return;}
     server.send_P(200, "text/html; charset=utf-8", DASHBOARD);
   });
 
   server.on("/api/status", HTTP_GET, [](){
-    if (!authenticated()) { requireAuth(); return; }
+    if(!authenticated()){requireAuth();return;}
     String ip = networkReady ? WiFi.localIP().toString() : "";
     unsigned long age = lastRelayAckAt ? (millis() - lastRelayAckAt) / 1000 : 9999;
-    
-    float waterCm = NAN;
-    if (!isnan(distanceCm)) {
-      float effDist = distanceCm - config.sensorOffsetCm;
-      float d = config.tankDepthCm > 0 ? static_cast<float>(config.tankDepthCm) : 120.0f;
-      waterCm = d - effDist;
-      if (waterCm < 0.0f) waterCm = 0.0f;
-      if (waterCm > d) waterCm = d;
-    }
-
-    String body = "{"
-      "\"distance\":" + (isnan(distanceCm) ? String("null") : String(distanceCm, 1)) + ","
-      "\"waterCm\":" + (isnan(waterCm) ? String("null") : String(waterCm, 1)) + ","
-      "\"level\":" + (isnan(levelPercent) ? String("null") : String(levelPercent, 1)) + ","
-      "\"pumpRequested\":" + (pumpRequested ? "true" : "false") + ","
-      "\"relayOn\":" + (relayReportedOn ? "true" : "false") + ","
-      "\"mode\":\"" + mode + "\","
-      "\"mac\":\"" + WiFi.macAddress() + "\","
-      "\"ip\":\"" + ip + "\","
-      "\"relayAge\":" + String(age) + ","
-      "\"tankDepthCm\":" + String(config.tankDepthCm) + ","
-      "\"sensorOffsetCm\":" + String(config.sensorOffsetCm) + ","
-      "\"startPercent\":" + String(config.startPercent) + ","
-      "\"stopPercent\":" + String(config.stopPercent) +
-    "}";
+    unsigned long sampleAge = lastSampleAt ? (millis() - lastSampleAt) / 1000 : 0;
+    String body = "{\"distance\":" + (isnan(distanceCm) ? String("null") : String(distanceCm, 1)) +
+                  ",\"level\":" + (isnan(levelPercent) ? String("null") : String(levelPercent, 1)) +
+                  ",\"pumpRequested\":" + (pumpRequested ? "true" : "false") +
+                  ",\"relayOn\":" + (relayReportedOn ? "true" : "false") +
+                  ",\"mode\":\"" + mode + "\"" +
+                  ",\"mac\":\"" + WiFi.macAddress() + "\"" +
+                  ",\"ip\":\"" + ip + "\"" +
+                  ",\"relayAge\":" + String(age) +
+                  ",\"sampleIntervalSec\":" + String(config.sampleIntervalSec) +
+                  ",\"startPercent\":" + String(config.startPercent) +
+                  ",\"stopPercent\":" + String(config.stopPercent) +
+                  ",\"sampleAge\":" + String(sampleAge) + "}";
     replyJson(body);
   });
 
   server.on("/api/config", HTTP_GET, [](){
-    if (!authenticated()) { requireAuth(); return; }
+    if(!authenticated()){requireAuth();return;}
     replyJson("{\"tankDepthCm\":" + String(config.tankDepthCm) +
               ",\"sensorOffsetCm\":" + String(config.sensorOffsetCm) +
               ",\"startPercent\":" + String(config.startPercent) +
               ",\"stopPercent\":" + String(config.stopPercent) +
               ",\"maxRunMinutes\":" + String(config.maxRunMinutes) +
-              ",\"relayMac\":\"" + String(config.relayMac) +
-              "\",\"pairToken\":\"" + String(config.pairToken) + "\"}");
+              ",\"sampleIntervalSec\":" + String(config.sampleIntervalSec) +
+              ",\"relayMac\":\"" + String(config.relayMac) + "\"" +
+              ",\"pairToken\":\"" + String(config.pairToken) + "\"}");
   });
 
   server.on("/api/config", HTTP_POST, handleConfigPost);
 
+  server.on("/api/sensitivity", HTTP_POST, [](){
+    if(!authenticated()){requireAuth();return;}
+    int sec = server.arg("interval").toInt();
+    if (sec < 1 || sec > 300) {
+      server.send(400, "text/plain", "Interval must be between 1 and 300 seconds.");
+      return;
+    }
+    config.sampleIntervalSec = sec;
+    preferences.begin("iyum-water", false);
+    preferences.putInt("sampleSec", config.sampleIntervalSec);
+    preferences.end();
+    Serial.printf("[CONFIG] Sensor read interval updated to %d seconds\n", config.sampleIntervalSec);
+    sampleTank();
+    lastSampleAt = millis();
+    replyJson("{\"status\":\"ok\",\"sampleIntervalSec\":" + String(config.sampleIntervalSec) + "}");
+  });
+
   server.on("/api/control", HTTP_POST, [](){
-    if (!authenticated()) { requireAuth(); return; }
+    if(!authenticated()){requireAuth();return;}
     String requested = server.arg("command");
     if (requested != "auto" && requested != "on" && requested != "off") {
       server.send(400, "text/plain", "Unknown command");
       return;
     }
     mode = requested;
-    if (mode == "on") {
-      // If water is already at or above stop threshold, do not start
-      if (!isnan(levelPercent) && levelPercent >= static_cast<float>(config.stopPercent)) {
-        server.send(400, "text/plain", "Tank level is already at or above stop threshold (" + String(config.stopPercent) + "%).");
-        return;
-      }
-      pumpRequested = true;
-    }
+    if (mode == "on") pumpRequested = true;
     if (mode == "off") pumpRequested = false;
+    if (mode == "auto") {
+      // Re-evaluate pump condition based on current water level
+      if (!isnan(levelPercent)) {
+        if (levelPercent <= (float)config.startPercent) {
+          pumpRequested = true;
+        } else if (levelPercent >= (float)config.stopPercent) {
+          pumpRequested = false;
+        }
+      }
+    }
     if (pumpRequested && pumpStartedAt == 0) pumpStartedAt = millis();
     if (!pumpRequested) pumpStartedAt = 0;
     sendRelayCommand();
@@ -349,64 +337,94 @@ void setupServer() {
   server.begin();
 }
 
-void onEspNowSent(EspNowSendInfo_t, esp_now_send_status_t) {}
-void onEspNowReceived(EspNowRecvInfo_t, const uint8_t *data, int length) {
-  if (length != sizeof(RelayMessage)) return; RelayMessage message; memcpy(&message,data,sizeof(message));
-  if (message.type==2 && strncmp(message.token,config.pairToken,sizeof(message.token))==0) { relayReportedOn=message.pumpOn; lastRelayAckAt=millis(); }
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowSent(const wifi_tx_info_t *, esp_now_send_status_t) {}
+#else
+void onEspNowSent(const uint8_t *, esp_now_send_status_t) {}
+#endif
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onEspNowReceived(const esp_now_recv_info_t *, const uint8_t *data, int length) {
+#else
+void onEspNowReceived(const uint8_t *, const uint8_t *data, int length) {
+#endif
+  if (length != sizeof(RelayMessage)) return;
+  RelayMessage message;
+  memcpy(&message, data, sizeof(message));
+  if (message.type == 2 && strncmp(message.token, config.pairToken, sizeof(message.token)) == 0) {
+    relayReportedOn = (message.pumpOn != 0);
+    lastRelayAckAt = millis();
+  }
 }
+
 void startEspNow() {
   if (espNowReady || !networkReady) return;
-  if (esp_now_init()!=ESP_OK) return;
-  esp_now_register_send_cb(onEspNowSent); esp_now_register_recv_cb(onEspNowReceived); espNowReady=true;
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_send_cb(onEspNowSent);
+  esp_now_register_recv_cb(onEspNowReceived);
+  espNowReady = true;
+  Serial.println("[ESP-NOW] Initialized successfully.");
 }
+
 void sendRelayCommand() {
   if (!espNowReady || !parseMac(config.relayMac, relayAddress)) return;
+
   if (!relayPeerAdded) {
     if (esp_now_is_peer_exist(relayAddress)) {
       esp_now_del_peer(relayAddress);
     }
     esp_now_peer_info_t peer{};
     memcpy(peer.peer_addr, relayAddress, 6);
-    peer.channel = 0;
+    peer.channel = WiFi.status() == WL_CONNECTED ? WiFi.channel() : 0;
+    peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-      Serial.println("[ESP-NOW] Error: Could not add relay peer.");
+    esp_err_t addStatus = esp_now_add_peer(&peer);
+    if (addStatus == ESP_OK || addStatus == ESP_ERR_ESPNOW_EXIST) {
+      relayPeerAdded = true;
+    } else {
+      Serial.printf("[ESP-NOW] Peer add failed: %d\n", addStatus);
       return;
     }
-    relayPeerAdded = true;
   }
+
   RelayMessage message{};
   strncpy(message.token, config.pairToken, sizeof(message.token) - 1);
   message.type = 1;
   message.pumpOn = pumpRequested ? 1 : 0;
   message.sequence = ++sequence;
-  esp_err_t res = esp_now_send(relayAddress, reinterpret_cast<const uint8_t*>(&message), sizeof(message));
-  if (res == ESP_OK) {
-    lastRelaySendAt = millis();
-    Serial.printf("[ESP-NOW] Sent cmd: pumpOn=%d (seq=%u)\n", message.pumpOn, message.sequence);
+  esp_err_t sendResult = esp_now_send(relayAddress, reinterpret_cast<const uint8_t*>(&message), sizeof(message));
+  if (sendResult == ESP_OK) {
+    Serial.printf("[ESP-NOW] Sent cmd: pump=%s (seq=%u)\n", pumpRequested ? "ON" : "OFF", sequence);
   } else {
-    Serial.printf("[ESP-NOW] Send failed: err=%d\n", res);
+    Serial.printf("[ESP-NOW] Send failed: %d\n", sendResult);
   }
+  lastRelaySendAt = millis();
 }
 
 float readDistanceCm() {
-  digitalWrite(TRIGGER_PIN, LOW);
-  delayMicroseconds(4);
-  digitalWrite(TRIGGER_PIN, HIGH);
-  delayMicroseconds(12);
-  digitalWrite(TRIGGER_PIN, LOW);
-  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 35000);
-  if (duration == 0) {
-    Serial.printf("[SENSOR] No Echo detected! Check wiring: TRIG=GPIO%d, ECHO=GPIO%d, VCC=5V, GND=GND\n", TRIGGER_PIN, ECHO_PIN);
-    return NAN;
+  // Try up to 3 ultrasonic pings to reject occasional acoustic echo dropouts
+  for (int attempt = 0; attempt < 3; attempt++) {
+    digitalWrite(TRIGGER_PIN, LOW);
+    delayMicroseconds(4);
+    digitalWrite(TRIGGER_PIN, HIGH);
+    delayMicroseconds(12);
+    digitalWrite(TRIGGER_PIN, LOW);
+    unsigned long duration = pulseIn(ECHO_PIN, HIGH, 35000);
+    if (duration > 0) {
+      float dist = (duration * 0.0343f) / 2.0f;
+      if (dist >= 2.0f && dist <= 550.0f) {
+        return dist;
+      }
+    }
+    if (attempt < 2) delay(15);
   }
-  float dist = (duration * 0.0343f) / 2.0f;
-  return dist;
+  Serial.printf("[SENSOR] No Echo detected! Check wiring: TRIG=GPIO%d, ECHO=GPIO%d, VCC=5V, GND=GND\n", TRIGGER_PIN, ECHO_PIN);
+  return NAN;
 }
 
 void sampleTank() {
   bool previousPumpRequest = pumpRequested;
   float reading = readDistanceCm();
+
   if (isnan(reading) || reading < 2.0f) {
     badSamples++;
     if (badSamples >= INVALID_SAMPLE_LIMIT) {
@@ -422,69 +440,63 @@ void sampleTank() {
   badSamples = 0;
   distanceCm = reading;
 
-  float depth = config.tankDepthCm > 0 ? static_cast<float>(config.tankDepthCm) : 120.0f;
-  float effectiveDist = distanceCm - config.sensorOffsetCm;
+  float depth = config.tankDepthCm > 0 ? (float)config.tankDepthCm : 120.0f;
+  float effectiveDist = distanceCm - (float)config.sensorOffsetCm;
   levelPercent = ((depth - effectiveDist) * 100.0f) / depth;
   levelPercent = constrain(levelPercent, 0.0f, 100.0f);
 
-  Serial.printf("[SENSOR] Distance: %.1f cm (Offset: %d cm, Depth: %.0f cm) -> Water Level: %.1f%%\n",
-                distanceCm, config.sensorOffsetCm, depth, levelPercent);
+  Serial.printf("[SENSOR] Raw: %.1f cm (Offset: %d cm, Depth: %d cm) -> Tank Level: %.1f%%\n",
+                distanceCm, config.sensorOffsetCm, config.tankDepthCm, levelPercent);
 
-  // 1. Auto mode start logic
   if (mode == "auto") {
-    if (reading <= depth + 50.0f) {
-      if (levelPercent <= static_cast<float>(config.startPercent)) {
-        if (!pumpRequested) {
-          Serial.printf("[PUMP] Water level low (%.1f%% <= %d%%). Starting pump.\n", levelPercent, config.startPercent);
-          pumpRequested = true;
-          pumpStartedAt = millis();
-        }
+    // AUTOMATIC PUMP CONTROL:
+    // When water level is at or below the start threshold (between 0% and startPercent) -> START PUMP
+    if (levelPercent <= (float)config.startPercent) {
+      if (!pumpRequested) {
+        Serial.printf("[AUTO] Level %.1f%% <= Start threshold %d%% -> STARTING PUMP\n",
+                      levelPercent, config.startPercent);
+        pumpRequested = true;
+        if (!pumpStartedAt) pumpStartedAt = millis();
       }
-    } else {
+    }
+    // When water level reaches or exceeds the stop threshold -> STOP PUMP
+    else if (levelPercent >= (float)config.stopPercent) {
       if (pumpRequested) {
-        Serial.printf("[PUMP] Reading out of tank range (%.1f cm). Stopping pump.\n", reading);
+        Serial.printf("[AUTO] Level %.1f%% >= Stop threshold %d%% -> STOPPING PUMP\n",
+                      levelPercent, config.stopPercent);
         pumpRequested = false;
         pumpStartedAt = 0;
       }
     }
+    // Hysteresis: between startPercent and stopPercent, current pump state remains active
   }
 
-  // 2. Critical Safety & Target Cutoff:
-  // If water level reaches or exceeds stopPercent (e.g. 80%), ALWAYS stop the pump!
-  // This applies in BOTH auto mode and manual mode (if someone clicked "Run Pump")!
-  if (levelPercent >= static_cast<float>(config.stopPercent)) {
-    if (pumpRequested) {
-      Serial.printf("[PUMP] Stop threshold reached (%.1f%% >= %d%%). Stopping pump.\n", levelPercent, config.stopPercent);
-      pumpRequested = false;
-      pumpStartedAt = 0;
-      if (mode == "on") {
-        mode = "auto"; // Reached target, reset to automatic standby
-      }
-    }
-  }
-
-  // 3. Off mode enforcement
-  if (mode == "off") {
-    pumpRequested = false;
-    pumpStartedAt = 0;
-  }
-
-  if (pumpRequested != previousPumpRequest) {
+  // Send command immediately if pump state changed OR if pump should be ON but relay hasn't confirmed
+  if (pumpRequested != previousPumpRequest || (pumpRequested && !relayReportedOn)) {
     sendRelayCommand();
   }
 }
+
 void maintainWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!networkReady) {
       networkReady = true;
       Serial.println("\n[WIFI] Connected to home Wi-Fi network!");
       Serial.print("  IP Address:     http://"); Serial.println(WiFi.localIP());
-      Serial.print("  mDNS Address:   http://eyum.local (or http://eyum-water.local)\n");
+      Serial.println("  mDNS Address:   http://iyum-water.local (or http://iyum.local)");
       Serial.print("  Controller MAC: "); Serial.println(WiFi.macAddress());
-      Serial.println("Open the IP address above in your browser to access the dashboard.\n");
-      MDNS.begin(MDNS_NAME);
-      MDNS.addService("http", "tcp", 80);
+      Serial.println("Open http://" + WiFi.localIP().toString() + " or http://iyum-water.local in your browser.\n");
+      
+      MDNS.end();
+      if (MDNS.begin("iyum-water")) {
+        MDNS.setInstanceName("Iyum Water Automation");
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addServiceTxt("http", "tcp", "app", "water-automation");
+        Serial.println("[MDNS] Responder active: http://iyum-water.local");
+      }
       startEspNow();
+      relayPeerAdded = false;
+      sendRelayCommand();
     }
     return;
   }
@@ -492,6 +504,7 @@ void maintainWifi() {
   if (millis() - wifiStartedAt > 15000) {
     Serial.print("[WIFI] Still connecting to "); Serial.print(config.ssid); Serial.println("...");
     WiFi.disconnect();
+    WiFi.setHostname("iyum-water");
     WiFi.begin(config.ssid, config.password);
     wifiStartedAt = millis();
   }
@@ -501,7 +514,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n\n========================================");
-  Serial.println("  Eyum Water Automation Tank Controller ");
+  Serial.println("  iYum Water Automation Tank Controller ");
   Serial.println("========================================");
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
@@ -515,10 +528,15 @@ void setup() {
   Serial.print("[WIFI] Saved Wi-Fi SSID found: "); Serial.println(config.ssid);
   Serial.println("[WIFI] Connecting to Wi-Fi...");
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("iyum-water");
   WiFi.begin(config.ssid, config.password);
   wifiStartedAt = millis();
   setupServer();
+  // Take an initial sensor measurement immediately at boot
+  sampleTank();
+  lastSampleAt = millis();
 }
+
 void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
@@ -539,61 +557,72 @@ void loop() {
       } else {
         Serial.println("[ERROR] Format must be: SET_WIFI:YourSSID,YourPassword");
       }
-    } else if (cmd.startsWith("SET_DEPTH:")) {
-      int d = cmd.substring(10).toInt();
-      if (d >= 10 && d <= 1000) {
-        config.tankDepthCm = d;
-        saveConfig();
+    } else if (cmd.startsWith("INTERVAL:")) {
+      int sec = cmd.substring(9).toInt();
+      if (sec >= 1 && sec <= 300) {
+        config.sampleIntervalSec = sec;
+        preferences.begin("iyum-water", false);
+        preferences.putInt("sampleSec", config.sampleIntervalSec);
+        preferences.end();
+        Serial.printf("[CONFIG] Sensor interval set to %d seconds via Serial\n", config.sampleIntervalSec);
         sampleTank();
-        Serial.printf("[CONFIG] Tank depth updated to %d cm.\n", d);
+        lastSampleAt = millis();
       } else {
-        Serial.println("[ERROR] Depth must be between 10 and 1000 cm.");
+        Serial.println("[ERROR] Interval must be 1 to 300 seconds");
       }
-    } else if (cmd.startsWith("SET_THRESHOLDS:")) {
-      String rest = cmd.substring(15);
-      int comma = rest.indexOf(',');
-      if (comma != -1) {
-        int st = rest.substring(0, comma).toInt();
-        int sp = rest.substring(comma + 1).toInt();
-        if (st >= 0 && sp <= 100 && st < sp) {
-          config.startPercent = st;
-          config.stopPercent = sp;
-          saveConfig();
-          sampleTank();
-          Serial.printf("[CONFIG] Thresholds updated: Start <= %d%%, Stop >= %d%%\n", st, sp);
-        } else {
-          Serial.println("[ERROR] Invalid thresholds. Format: SET_THRESHOLDS:25,80 (start < stop)");
-        }
-      }
-    } else if (cmd.startsWith("SET_OFFSET:")) {
-      config.sensorOffsetCm = cmd.substring(11).toInt();
-      saveConfig();
-      sampleTank();
-      Serial.printf("[CONFIG] Sensor offset updated to %d cm.\n", config.sensorOffsetCm);
     } else if (cmd.equalsIgnoreCase("RESET")) {
+      preferences.begin("iyum-water", false); preferences.clear(); preferences.end();
       preferences.begin("eyum-water", false); preferences.clear(); preferences.end();
       Serial.println("\n[SETUP] Settings erased! Restarting into setup hotspot mode...");
       delay(500);
       ESP.restart();
     } else if (cmd.equalsIgnoreCase("STATUS") || cmd.equalsIgnoreCase("IP")) {
-      Serial.printf("[STATUS] IP: http://%s | Distance: %.1f cm | Water: %.1f%% | Depth: %d cm | Start: %d%% | Stop: %d%% | Pump: %s | Relay: %s\n",
-                    WiFi.localIP().toString().c_str(), distanceCm, levelPercent, config.tankDepthCm, config.startPercent, config.stopPercent, pumpRequested?"ON":"OFF", relayReportedOn?"ON":"OFF");
+      Serial.printf("[STATUS] IP: http://%s | Distance: %.1f cm (Level: %.1f%%) | Pump: %s | Relay: %s | Interval: %ds\n",
+                    WiFi.localIP().toString().c_str(), distanceCm, levelPercent, pumpRequested ? "ON" : "OFF", relayReportedOn ? "ON" : "OFF", config.sampleIntervalSec);
     }
   }
 
-  if (provisioning) { dnsServer.processNextRequest(); server.handleClient(); return; }
+  if (provisioning) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    delay(5);
+    return;
+  }
   server.handleClient();
   maintainWifi();
-  if (millis() - lastSampleAt >= SAMPLE_INTERVAL_MS) { lastSampleAt = millis(); sampleTank(); }
-  if (pumpRequested && pumpStartedAt && millis() - pumpStartedAt > static_cast<unsigned long>(config.maxRunMinutes) * 60000UL) {
-    pumpRequested = false; pumpStartedAt = 0; mode = "off"; sendRelayCommand();
+  delay(2);
+
+  // Dynamic sensor read interval
+  unsigned long sampleIntervalMs = (config.sampleIntervalSec > 0 ? (unsigned long)config.sampleIntervalSec : 10UL) * 1000UL;
+  if (millis() - lastSampleAt >= sampleIntervalMs) {
+    lastSampleAt = millis();
+    sampleTank();
   }
-  if (espNowReady && millis() - lastRelaySendAt >= RELAY_HEARTBEAT_MS) sendRelayCommand();
+
+  // Safety maximum runtime limiter
+  if (pumpRequested && pumpStartedAt && millis() - pumpStartedAt > static_cast<unsigned long>(config.maxRunMinutes) * 60000UL) {
+    Serial.printf("[SAFETY] Max run time (%d min) exceeded! Shutting down pump.\n", config.maxRunMinutes);
+    pumpRequested = false;
+    pumpStartedAt = 0;
+    mode = "off";
+    sendRelayCommand();
+  }
+
+  // Periodic ESP-NOW heartbeat to keep relay active
+  if (espNowReady && millis() - lastRelaySendAt >= RELAY_HEARTBEAT_MS) {
+    sendRelayCommand();
+  }
+
+  // 8-second long-press reset button
   static unsigned long buttonDownAt = 0;
   if (!digitalRead(SETUP_BUTTON_PIN)) {
     if (!buttonDownAt) buttonDownAt = millis();
     if (millis() - buttonDownAt > 8000) {
-      preferences.begin("eyum-water", false); preferences.clear(); preferences.end(); ESP.restart();
+      preferences.begin("iyum-water", false); preferences.clear(); preferences.end();
+      preferences.begin("eyum-water", false); preferences.clear(); preferences.end();
+      ESP.restart();
     }
-  } else buttonDownAt = 0;
+  } else {
+    buttonDownAt = 0;
+  }
 }

@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("esp32_controller", "esp01_relay", "all")]
+  [ValidateSet("esp32", "esp32_controller", "esp32c3mini", "esp01_relay", "all")]
   [string]$Target = "all"
 )
 
@@ -18,6 +18,8 @@ if (-not (Get-Command pio -ErrorAction SilentlyContinue)) {
 
 if ($Target -eq "all") {
   pio run -e esp32_controller
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  pio run -e esp32c3mini
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   pio run -e esp01_relay
   exit $LASTEXITCODE
