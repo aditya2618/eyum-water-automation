@@ -17,7 +17,7 @@ constexpr uint8_t SETUP_BUTTON_PIN = 23; // hold low for 8 seconds to erase Wi-F
 constexpr char AP_SSID[] = "iYum-Water-Setup";
 constexpr char AP_PASSWORD[] = "iyumsetup";
 constexpr char MDNS_NAME[] = "iyum-water";
-constexpr unsigned long RELAY_HEARTBEAT_MS = 6000;
+constexpr unsigned long RUNNING_HEARTBEAT_MS = 20000; // Sent only while pump is actively running (Option B)
 constexpr uint8_t INVALID_SAMPLE_LIMIT = 3;
 
 struct Config {
@@ -343,26 +343,54 @@ void onEspNowSent(const wifi_tx_info_t *, esp_now_send_status_t) {}
 void onEspNowSent(const uint8_t *, esp_now_send_status_t) {}
 #endif
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-void onEspNowReceived(const esp_now_recv_info_t *, const uint8_t *data, int length) {
+void onEspNowReceived(const esp_now_recv_info_t *info, const uint8_t *data, int length) {
+  const uint8_t *sender = info ? info->src_addr : nullptr;
 #else
-void onEspNowReceived(const uint8_t *, const uint8_t *data, int length) {
+void onEspNowReceived(const uint8_t *sender, const uint8_t *data, int length) {
 #endif
+  if (sender) {
+    Serial.printf("[ESP-NOW] Received %d bytes from %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  length, sender[0], sender[1], sender[2], sender[3], sender[4], sender[5]);
+  }
   if (length != sizeof(RelayMessage)) return;
   RelayMessage message;
   memcpy(&message, data, sizeof(message));
-  if (message.type == 2 && strncmp(message.token, config.pairToken, sizeof(message.token)) == 0) {
-    relayReportedOn = (message.pumpOn != 0);
-    lastRelayAckAt = millis();
+  if (message.type == 2) {
+    if (strlen(config.pairToken) == 0 || strncmp(message.token, config.pairToken, sizeof(message.token)) == 0) {
+      relayReportedOn = (message.pumpOn != 0);
+      lastRelayAckAt = millis();
+      Serial.printf("[ESP-NOW] Relay ACK confirmed: motor is %s\n", relayReportedOn ? "ON" : "OFF");
+    } else {
+      Serial.printf("[ESP-NOW] ACK token mismatch: got '%s', expected '%s'\n", message.token, config.pairToken);
+    }
   }
 }
 
 void startEspNow() {
   if (espNowReady || !networkReady) return;
+  WiFi.setSleep(false); // CRITICAL: Disable modem sleep so radio continuously listens for incoming ACKs
   if (esp_now_init() != ESP_OK) return;
   esp_now_register_send_cb(onEspNowSent);
   esp_now_register_recv_cb(onEspNowReceived);
   espNowReady = true;
-  Serial.println("[ESP-NOW] Initialized successfully.");
+  Serial.println("[ESP-NOW] Initialized successfully with WiFi sleep disabled.");
+
+  // Pre-register relay peer if MAC is configured
+  if (parseMac(config.relayMac, relayAddress)) {
+    if (esp_now_is_peer_exist(relayAddress)) {
+      esp_now_del_peer(relayAddress);
+    }
+    esp_now_peer_info_t peer{};
+    memcpy(peer.peer_addr, relayAddress, 6);
+    peer.channel = 0; // Use current station channel
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    esp_err_t addStatus = esp_now_add_peer(&peer);
+    if (addStatus == ESP_OK || addStatus == ESP_ERR_ESPNOW_EXIST) {
+      relayPeerAdded = true;
+      Serial.printf("[ESP-NOW] Relay peer pre-registered: %s\n", config.relayMac);
+    }
+  }
 }
 
 void sendRelayCommand() {
@@ -374,7 +402,7 @@ void sendRelayCommand() {
     }
     esp_now_peer_info_t peer{};
     memcpy(peer.peer_addr, relayAddress, 6);
-    peer.channel = WiFi.status() == WL_CONNECTED ? WiFi.channel() : 0;
+    peer.channel = 0; // Use current channel
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     esp_err_t addStatus = esp_now_add_peer(&peer);
@@ -430,9 +458,16 @@ void sampleTank() {
     if (badSamples >= INVALID_SAMPLE_LIMIT) {
       distanceCm = NAN;
       levelPercent = NAN;
-      pumpRequested = false;
-      pumpStartedAt = 0;
-      if (previousPumpRequest) sendRelayCommand();
+      // In Auto mode, safety shut down if sensor echo is lost.
+      // In Manual 'on' mode, do not override user's manual run command.
+      if (mode == "auto") {
+        if (pumpRequested) {
+          Serial.println("[SAFETY] Ultrasonic sensor lost in Auto mode! Shutting down pump.");
+          pumpRequested = false;
+          pumpStartedAt = 0;
+          sendRelayCommand();
+        }
+      }
     }
     return;
   }
@@ -471,8 +506,8 @@ void sampleTank() {
     // Hysteresis: between startPercent and stopPercent, current pump state remains active
   }
 
-  // Send command immediately if pump state changed OR if pump should be ON but relay hasn't confirmed
-  if (pumpRequested != previousPumpRequest || (pumpRequested && !relayReportedOn)) {
+  // Send command immediately if pump state changed
+  if (pumpRequested != previousPumpRequest) {
     sendRelayCommand();
   }
 }
@@ -481,6 +516,7 @@ void maintainWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!networkReady) {
       networkReady = true;
+      WiFi.setSleep(false); // CRITICAL: Disable modem sleep so radio continuously listens
       Serial.println("\n[WIFI] Connected to home Wi-Fi network!");
       Serial.print("  IP Address:     http://"); Serial.println(WiFi.localIP());
       Serial.println("  mDNS Address:   http://iyum-water.local (or http://iyum.local)");
@@ -528,6 +564,7 @@ void setup() {
   Serial.print("[WIFI] Saved Wi-Fi SSID found: "); Serial.println(config.ssid);
   Serial.println("[WIFI] Connecting to Wi-Fi...");
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // CRITICAL: Disable modem sleep
   WiFi.setHostname("iyum-water");
   WiFi.begin(config.ssid, config.password);
   wifiStartedAt = millis();
@@ -608,8 +645,9 @@ void loop() {
     sendRelayCommand();
   }
 
-  // Periodic ESP-NOW heartbeat to keep relay active
-  if (espNowReady && millis() - lastRelaySendAt >= RELAY_HEARTBEAT_MS) {
+  // Option B: Safety watchdog refresh - ONLY sent while pump is actively running (every 20s)
+  // When pump is OFF, zero periodic commands are sent (no spam).
+  if (espNowReady && pumpRequested && millis() - lastRelaySendAt >= RUNNING_HEARTBEAT_MS) {
     sendRelayCommand();
   }
 

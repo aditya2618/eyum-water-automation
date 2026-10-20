@@ -238,6 +238,7 @@ input:focus{outline:0;border-color:var(--accent)}
   <div class="header-badges">
     <div class="badge"><span class="dot dot-green"></span><span id="badge-controller">Online</span></div>
     <div class="badge"><span class="dot" id="dot-relay"></span><span id="badge-relay">Switch...</span></div>
+    <div class="badge" title="Controller MAC address (Click to copy)" style="cursor:pointer" onclick="copyMac()"><span class="dot dot-blue"></span><span id="badge-mac">MAC...</span></div>
     <div class="badge" style="background:rgba(0,198,255,0.08);border-color:rgba(0,198,255,0.3)">
       <span class="dot dot-blue"></span>
       <a href="http://iyum-water.local" style="color:var(--accent);text-decoration:none;font-weight:700">http://iyum-water.local</a>
@@ -345,6 +346,15 @@ input:focus{outline:0;border-color:var(--accent)}
 </div>
 
 <form class="card" id="cfg-form" onsubmit="saveCfg(event)" style="text-align:left">
+  <!-- Prominent Controller MAC Banner -->
+  <div style="background:rgba(0,198,255,0.06);border:1px solid rgba(0,198,255,0.25);border-radius:10px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <div>
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);font-weight:700">Controller MAC Address (Needed for ESP-01 Relay setup)</div>
+      <div id="lbl-controller-mac" style="font-family:monospace;font-size:15px;font-weight:700;color:var(--accent);letter-spacing:0.04em;margin-top:2px">Connecting...</div>
+    </div>
+    <button type="button" class="copy-btn" onclick="copyMac()" title="Copy Controller MAC for ESP-01">&#128203; Copy MAC</button>
+  </div>
+
   <div class="form-grid">
     <div class="form-item">
       <label>Tank Height (cm)</label>
@@ -384,10 +394,10 @@ input:focus{outline:0;border-color:var(--accent)}
     </div>
   </div>
 
-  <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
-    <button type="submit" class="btn btn-auto" style="flex:1;padding:12px">&#128190; Save Configuration</button>
-    <button type="button" class="copy-btn" onclick="copyMac()" title="Copy Controller MAC for ESP-01">Copy MAC</button>
+  <div style="margin-top:12px">
+    <button type="submit" class="btn btn-auto" style="width:100%;padding:12px">&#128190; Save Configuration</button>
   </div>
+  <div id="cfg-toast" class="toast" style="display:none;margin-top:12px;font-weight:700"></div>
 </form>
 </div>
 
@@ -402,10 +412,26 @@ let lastSampleAgeSec = 0;
 let failCount = 0;
 let isUpdating = false;
 
+function fallbackCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
 function copyMac() {
   if (!currentMac) return;
-  navigator.clipboard.writeText(currentMac);
-  $('#msg-toast').innerHTML = "&#9989; Copied controller MAC: " + currentMac;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(currentMac).catch(() => fallbackCopy(currentMac));
+  } else {
+    fallbackCopy(currentMac);
+  }
+  $('#msg-toast').innerHTML = "&#9989; Copied controller MAC: <b>" + currentMac + "</b>";
 }
 
 function setMarkerPosition(el, pct) {
@@ -474,7 +500,9 @@ async function updateStatus() {
     const d = await res.json();
     failCount = 0;
     currentMac = d.mac || "";
-    $('#dev-info').textContent = "IP: http://" + (d.ip || "Connecting...") + " • http://iyum-water.local";
+    $('#dev-info').textContent = "IP: http://" + (d.ip || "Connecting...") + " • MAC: " + (currentMac || "--");
+    if ($('#lbl-controller-mac')) $('#lbl-controller-mac').textContent = currentMac || "--";
+    if ($('#badge-mac')) $('#badge-mac').textContent = "MAC: " + (currentMac || "--");
 
     if (d.sampleIntervalSec && d.sampleIntervalSec !== currentIntervalSec) {
       updatePresetUI(d.sampleIntervalSec);
@@ -531,7 +559,7 @@ async function updateStatus() {
     $('#val-relay').style.color = d.relayOn ? "var(--success)" : "var(--text-muted)";
 
     const dotR = $('#dot-relay');
-    if (d.relayAge < 15) {
+    if (d.relayAge < 9999) {
       dotR.className = "dot dot-green";
       $('#badge-relay').textContent = "Switch Linked";
     } else {
@@ -593,8 +621,18 @@ async function loadConfig() {
 
 async function saveCfg(e) {
   e.preventDefault();
+  const cfgToast = $('#cfg-toast');
+  const mainToast = $('#msg-toast');
+  if (cfgToast) {
+    cfgToast.style.display = "block";
+    cfgToast.style.background = "rgba(0,198,255,0.12)";
+    cfgToast.style.border = "1px solid var(--accent)";
+    cfgToast.style.color = "var(--accent)";
+    cfgToast.innerHTML = "&#9203; Saving configuration...";
+  }
+  if (mainToast) mainToast.innerHTML = "&#9203; Saving...";
+
   try {
-    $('#msg-toast').innerHTML = "&#9203; Saving...";
     const form = e.target;
     const res = await fetch('/api/config', {
       method: 'POST',
@@ -603,15 +641,37 @@ async function saveCfg(e) {
     });
     const txt = await res.text();
     if (!res.ok) {
-      $('#msg-toast').innerHTML = "&#10060; " + txt;
+      if (cfgToast) {
+        cfgToast.style.display = "block";
+        cfgToast.style.background = "rgba(255,82,82,0.15)";
+        cfgToast.style.border = "1px solid var(--danger)";
+        cfgToast.style.color = "var(--danger)";
+        cfgToast.innerHTML = "&#10060; <b>Save Unsuccessful:</b> " + txt;
+      }
+      if (mainToast) mainToast.innerHTML = "&#10060; " + txt;
       return;
     }
-    $('#msg-toast').innerHTML = "&#9989; " + txt;
+    if (cfgToast) {
+      cfgToast.style.display = "block";
+      cfgToast.style.background = "rgba(0,230,118,0.15)";
+      cfgToast.style.border = "1px solid var(--success)";
+      cfgToast.style.color = "var(--success)";
+      cfgToast.innerHTML = "&#9989; <b>Success:</b> " + txt;
+    }
+    if (mainToast) mainToast.innerHTML = "&#9989; " + txt;
     const sampleInp = form.querySelector('[name="sampleIntervalSec"]');
     if (sampleInp) updatePresetUI(parseInt(sampleInp.value) || 10);
     updateStatus();
+    setTimeout(() => { if (cfgToast) cfgToast.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 50);
   } catch(e) {
-    $('#msg-toast').innerHTML = "&#10060; " + e.message;
+    if (cfgToast) {
+      cfgToast.style.display = "block";
+      cfgToast.style.background = "rgba(255,82,82,0.15)";
+      cfgToast.style.border = "1px solid var(--danger)";
+      cfgToast.style.color = "var(--danger)";
+      cfgToast.innerHTML = "&#10060; <b>Save Error:</b> " + e.message;
+    }
+    if (mainToast) mainToast.innerHTML = "&#10060; " + e.message;
   }
 }
 
