@@ -14,6 +14,7 @@ The ESP32 owns the safety logic. The relay never starts by itself, turns off aft
 - [`src/esp32/esp32.ino`](src/esp32/esp32.ino) — ESP32 DevKit V1 (38-pin) firmware (Trigger: GPIO 18, Echo: GPIO 19, Setup: GPIO 23).
 - [`src/esp32c3mini/esp32c3mini.ino`](src/esp32c3mini/esp32c3mini.ino) — ESP32-C3 Super Mini firmware (Trigger: GPIO 0, Echo: GPIO 1, Setup: GPIO 9 onboard BOOT).
 - [`src/relay_node/relay_node.ino`](src/relay_node/relay_node.ino) — ESP-01 firmware, provisioning portal, authenticated ESP-NOW relay listener, and relay watchdog.
+- [`mobile-app/`](mobile-app/) — Cross-platform mobile wrapper app (React Native / Expo) for iOS and Android to view and control the dashboard natively without a browser.
 
 ## Parts
 
